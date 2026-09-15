@@ -1,3 +1,4 @@
+// origin: vantage-peers@335791f convex/messages.ts (pre-fix, for the MX1 positive control)
 import { ConvexError, v } from "convex/values";
 // convex-strict-mode-doc-type-import-needed-when-refactoring-list-query-from-early-return-to-accumulator-post-filter
 import type { Doc } from "./_generated/dataModel";
@@ -408,15 +409,14 @@ export const checkNewMessages = query({
 					: await ctx.db
 							.query("messageReceipts")
 							.withIndex("by_instance_unread", (q) =>
-								q
-									.eq("recipientInstanceId", args.recipientInstanceId!)
-									.eq("readAt", undefined),
+								q.eq("recipientInstanceId", args.recipientInstanceId!),
 							)
-							.filter((q) =>
-								args.since !== undefined
-									? q.gt(q.field("_creationTime"), args.since)
-									: true,
-							)
+							.filter((q) => {
+								const base = q.eq(q.field("readAt"), undefined);
+								return args.since !== undefined
+									? q.and(base, q.gt(q.field("_creationTime"), args.since))
+									: base;
+							})
 							.take(100);
 
 			const roleReceipts =
@@ -439,10 +439,13 @@ export const checkNewMessages = query({
 					: await ctx.db
 							.query("messageReceipts")
 							.withIndex("by_recipient_unread", (q) =>
-								q.eq("recipient", args.recipient).eq("readAt", undefined),
+								q.eq("recipient", args.recipient),
 							)
 							.filter((q) => {
-								const base = q.eq(q.field("recipientInstanceId"), undefined);
+								const base = q.and(
+									q.eq(q.field("readAt"), undefined),
+									q.eq(q.field("recipientInstanceId"), undefined),
+								);
 								return args.since !== undefined
 									? q.and(base, q.gt(q.field("_creationTime"), args.since))
 									: base;
@@ -484,13 +487,14 @@ export const checkNewMessages = query({
 				receipts = await ctx.db
 					.query("messageReceipts")
 					.withIndex("by_recipient_unread", (q) =>
-						q.eq("recipient", args.recipient).eq("readAt", undefined),
+						q.eq("recipient", args.recipient),
 					)
-					.filter((q) =>
-						args.since !== undefined
-							? q.gt(q.field("_creationTime"), args.since)
-							: true,
-					)
+					.filter((q) => {
+						const base = q.eq(q.field("readAt"), undefined);
+						return args.since !== undefined
+							? q.and(base, q.gt(q.field("_creationTime"), args.since))
+							: base;
+					})
 					.take(100);
 			}
 		}
@@ -588,15 +592,14 @@ export const checkNewMessagesEnvelope = query({
 					: await ctx.db
 							.query("messageReceipts")
 							.withIndex("by_instance_unread", (q) =>
-								q
-									.eq("recipientInstanceId", args.recipientInstanceId!)
-									.eq("readAt", undefined),
+								q.eq("recipientInstanceId", args.recipientInstanceId!),
 							)
-							.filter((q) =>
-								args.since !== undefined
-									? q.gt(q.field("_creationTime"), args.since)
-									: true,
-							)
+							.filter((q) => {
+								const base = q.eq(q.field("readAt"), undefined);
+								return args.since !== undefined
+									? q.and(base, q.gt(q.field("_creationTime"), args.since))
+									: base;
+							})
 							.take(takeBudget);
 
 			const roleReceipts =
@@ -619,10 +622,13 @@ export const checkNewMessagesEnvelope = query({
 					: await ctx.db
 							.query("messageReceipts")
 							.withIndex("by_recipient_unread", (q) =>
-								q.eq("recipient", args.recipient).eq("readAt", undefined),
+								q.eq("recipient", args.recipient),
 							)
 							.filter((q) => {
-								const base = q.eq(q.field("recipientInstanceId"), undefined);
+								const base = q.and(
+									q.eq(q.field("readAt"), undefined),
+									q.eq(q.field("recipientInstanceId"), undefined),
+								);
 								return args.since !== undefined
 									? q.and(base, q.gt(q.field("_creationTime"), args.since))
 									: base;
@@ -660,13 +666,14 @@ export const checkNewMessagesEnvelope = query({
 			receipts = await ctx.db
 				.query("messageReceipts")
 				.withIndex("by_recipient_unread", (q) =>
-					q.eq("recipient", args.recipient).eq("readAt", undefined),
+					q.eq("recipient", args.recipient),
 				)
-				.filter((q) =>
-					args.since !== undefined
-						? q.gt(q.field("_creationTime"), args.since)
-						: true,
-				)
+				.filter((q) => {
+					const base = q.eq(q.field("readAt"), undefined);
+					return args.since !== undefined
+						? q.and(base, q.gt(q.field("_creationTime"), args.since))
+						: base;
+				})
 				.take(takeBudget);
 		}
 
@@ -961,8 +968,9 @@ export const getUnreadCount = query({
 		const receipts = await ctx.db
 			.query("messageReceipts")
 			.withIndex("by_recipient_unread", (q) =>
-				q.eq("recipient", orchestratorId).eq("readAt", undefined),
+				q.eq("recipient", orchestratorId),
 			)
+			.filter((q) => q.eq(q.field("readAt"), undefined))
 			.take(UNREAD_RECEIPTS_SCAN_CAP);
 		return receipts.length;
 	},
