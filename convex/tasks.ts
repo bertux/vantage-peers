@@ -348,6 +348,9 @@ const taskFullValidator = v.object({
 	),
 	pausedAt: v.optional(v.number()),
 	durationSource: v.optional(v.union(v.literal("segments"), v.literal("legacy"))),
+	// Issue #1293 -- see convex/schema.ts for the full rationale.
+	reviewPrRepoFullName: v.optional(v.string()),
+	reviewPrNumber: v.optional(v.number()),
 });
 
 type TaskLite = {
@@ -554,6 +557,9 @@ export const get = query({
 			durationSource: v.optional(
 				v.union(v.literal("segments"), v.literal("legacy")),
 			),
+			// Issue #1293 -- see convex/schema.ts for the full rationale.
+			reviewPrRepoFullName: v.optional(v.string()),
+			reviewPrNumber: v.optional(v.number()),
 		}),
 		v.null(),
 	),
@@ -636,6 +642,9 @@ export const getById = query({
 			durationSource: v.optional(
 				v.union(v.literal("segments"), v.literal("legacy")),
 			),
+			// Issue #1293 -- see convex/schema.ts for the full rationale.
+			reviewPrRepoFullName: v.optional(v.string()),
+			reviewPrNumber: v.optional(v.number()),
 		}),
 		v.null(),
 	),
@@ -3593,7 +3602,7 @@ const REVIEW_TITLE_RE = /^\[Review\] (.+) PR #(\d+): ([\s\S]*)$/;
  * Parse a "[Review] <repoFullName> PR #<prNumber>: <prTitle>" task title.
  * Returns null if the title does not match the expected pattern.
  */
-function parseReviewTitle(
+export function parseReviewTitle(
 	title: string,
 ): { repoFullName: string; prNumber: number; prTitle: string } | null {
 	const m = REVIEW_TITLE_RE.exec(title);
@@ -3601,13 +3610,38 @@ function parseReviewTitle(
 	return { repoFullName: m[1], prNumber: parseInt(m[2], 10), prTitle: m[3] };
 }
 
-const REVIEW_OPEN_STATUSES = ["todo", "in_progress", "review", "blocked"] as const;
+// Exported (in addition to the internal REVIEW_OPEN_STATUSES usages below) so
+// migrations.ts backfillReviewPrLinkFields can scan the exact same open-status
+// set when backfilling legacy rows — issue #1293.
+export const REVIEW_OPEN_STATUSES = ["todo", "in_progress", "review", "blocked"] as const;
 
 /**
  * Find all currently-open "[Review]" tasks matching a (repoFullName,
- * prNumber) tuple. Scans the by_status index per open status (bounded to 4
- * scans), then filters in memory by parsing the title — same pattern as
- * createDeployTaskWithDedup's Fix 1/Fix 3 scans.
+ * prNumber) tuple.
+ *
+ * Issue #1293: this used to scan the by_status index per open status
+ * (4 unbounded `.collect()` calls over EVERY row in that status, fleet-wide)
+ * and filter in memory by parsing each row's title, on EVERY call — and
+ * "no match" (a new PR with no review task yet, or a PR whose review task is
+ * already closed) is the COMMON case, so that unbounded scan ran on most
+ * webhook events, not just the sweep's multiplied calls.
+ *
+ * Now bound by the `by_review_pr` index (reviewPrRepoFullName, reviewPrNumber,
+ * status) ONLY — this is the sole lookup on the hot path, deliberately with
+ * no scan-based fallback. Each of the 4 lookups below only ever touches rows
+ * that share this exact PR link and this exact status — typically 0 or 1
+ * rows — no matter how large the `tasks` table grows or how many calls find
+ * nothing to close. No title parsing on this path.
+ *
+ * Every row created by createOrUpdateReviewTask is stamped with these
+ * fields at insert, so this index sees every row this mutation itself ever
+ * creates. Rows that predate this field (or were seeded directly, bypassing
+ * createOrUpdateReviewTask) are invisible to this index BY DESIGN — see
+ * migrations.ts `backfillReviewPrLinkFields` (must run once immediately
+ * after this deploy) and reviewBacklogSweep.ts, which closes exactly those
+ * legacy rows in the interim by passing `closeReviewTasksForPr` the row's
+ * own `taskId` (a direct `ctx.db.get`, not a scan) rather than relying on
+ * this function to find them.
  */
 async function findOpenReviewTasks(
 	ctx: MutationCtx,
@@ -3618,14 +3652,14 @@ async function findOpenReviewTasks(
 	for (const status of REVIEW_OPEN_STATUSES) {
 		const batch = await ctx.db
 			.query("tasks")
-			.withIndex("by_status", (q) => q.eq("status", status))
+			.withIndex("by_review_pr", (q) =>
+				q
+					.eq("reviewPrRepoFullName", repoFullName)
+					.eq("reviewPrNumber", prNumber)
+					.eq("status", status),
+			)
 			.collect();
-		for (const t of batch) {
-			const p = parseReviewTitle(t.title);
-			if (p && p.repoFullName === repoFullName && p.prNumber === prNumber) {
-				matches.push(t);
-			}
-		}
+		matches.push(...batch);
 	}
 	return matches;
 }
@@ -3679,6 +3713,12 @@ export const createOrUpdateReviewTask = internalMutation({
 				tags: args.tags,
 				priority: args.priority,
 				updatedAt: now,
+				// Re-stamp on every update too, so a legacy row backfilled by
+				// migrations.ts backfillReviewPrLinkFields (or a row that somehow
+				// drifted) is always corrected back to the args this call was
+				// actually invoked with — issue #1293.
+				reviewPrRepoFullName: args.repoFullName,
+				reviewPrNumber: args.prNumber,
 			});
 			return target._id;
 		}
@@ -3703,6 +3743,11 @@ export const createOrUpdateReviewTask = internalMutation({
 			// internalMutation is the ONLY code path that writes `origin`;
 			// it is unreachable from the public MCP surface (webhook-only).
 			origin: "automation" as const,
+			// Issue #1293 — the bound lookup key for findOpenReviewTasks /
+			// closeReviewTasksForPr (`by_review_pr` index), stamped directly from
+			// this call's own args rather than re-parsed from the title later.
+			reviewPrRepoFullName: args.repoFullName,
+			reviewPrNumber: args.prNumber,
 		});
 	},
 });
@@ -3718,13 +3763,26 @@ export const createOrUpdateReviewTask = internalMutation({
  * NEVER on `createdBy`/`origin` — findOpenReviewTasks matches ANY row whose
  * title parses to this (repoFullName, prNumber) tuple, regardless of which
  * code path inserted it. This is what makes the close idempotent: rows
- * already "done" are excluded by findOpenReviewTasks (it only scans
- * REVIEW_OPEN_STATUSES), so a webhook delivered twice for the same PR finds
- * zero matches on the second pass and changes nothing (delta zero) — and a
- * row a human already closed by hand stays closed for the same reason.
+ * already "done" are excluded by findOpenReviewTasks (it only scans open
+ * statuses through the `by_review_pr` index), so a webhook delivered twice
+ * for the same PR finds zero matches on the second pass and changes nothing
+ * (delta zero) — and a row a human already closed by hand stays closed for
+ * the same reason.
  *
  * `mergeCommitSha` (optional) is appended to the completion note so the
  * merge commit is carried on the row without adding a new schema field.
+ *
+ * `taskId` (optional, issue #1293) — when the CALLER already knows the exact
+ * row to close (reviewBacklogSweep's loop gets `_id` straight from
+ * listReviewBacklogByLineage), pass it here to close that ONE row by direct
+ * `ctx.db.get` instead of re-deriving it through findOpenReviewTasks. This is
+ * what actually multiplied production's system-operations budget: the sweep
+ * calls this mutation once PER BACKLOG ROW, and every one of those calls used
+ * to re-run the full lookup from scratch. `repoFullName`/`prNumber` are still
+ * required and are re-checked against the fetched row (by the stamped
+ * reviewPrRepoFullName/reviewPrNumber fields when present, else by re-parsing
+ * the title) before closing it, so a caller-supplied `taskId` can narrow but
+ * never widen which row this call is allowed to close.
  */
 export const closeReviewTasksForPr = internalMutation({
 	args: {
@@ -3732,15 +3790,35 @@ export const closeReviewTasksForPr = internalMutation({
 		prNumber: v.number(),
 		completionNote: v.string(),
 		mergeCommitSha: v.optional(v.string()),
+		taskId: v.optional(v.id("tasks")),
 	},
 	returns: v.object({ closed: v.number() }),
 	handler: async (ctx, args) => {
 		const now = Date.now();
-		const matches = await findOpenReviewTasks(
-			ctx,
-			args.repoFullName,
-			args.prNumber,
-		);
+		let matches: Doc<"tasks">[];
+		if (args.taskId !== undefined) {
+			const row = await ctx.db.get(args.taskId);
+			const linkMatches =
+				row !== null &&
+				(row.reviewPrRepoFullName !== undefined ||
+				row.reviewPrNumber !== undefined
+					? row.reviewPrRepoFullName === args.repoFullName &&
+						row.reviewPrNumber === args.prNumber
+					: parseReviewTitle(row.title)?.repoFullName === args.repoFullName &&
+						parseReviewTitle(row.title)?.prNumber === args.prNumber);
+			matches =
+				row !== null &&
+				linkMatches &&
+				(REVIEW_OPEN_STATUSES as readonly string[]).includes(row.status)
+					? [row]
+					: [];
+		} else {
+			matches = await findOpenReviewTasks(
+				ctx,
+				args.repoFullName,
+				args.prNumber,
+			);
+		}
 
 		const note = args.mergeCommitSha
 			? `${args.completionNote} (merge commit ${args.mergeCommitSha})`
