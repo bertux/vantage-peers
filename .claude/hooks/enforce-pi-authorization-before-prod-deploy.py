@@ -12,11 +12,19 @@ unless one of:
     `# read-only-query: <reason>` (k174v3sw, Day-111). Scoped to convex-run
     only -- a `convex deploy` can NEVER bypass via this marker.
 
-When env var or flag present, the hook validates the referenced VP task via
-Convex HTTP public API (no CLI auth required -- workspace-agnostic):
-  - Task must have tag [PROD-DEPLOY-AUTHORIZED]
+Whichever form carries the id, the hook FETCHES the referenced VP task via the
+Convex HTTP public API (no CLI auth required -- workspace-agnostic) and
+validates it before allowing:
+  - [PROD-DEPLOY-AUTHORIZED] must appear in the task TITLE or its tags
+    (every token actually issued carries it in the title; tags is null)
   - Task must have been created within the last 60 minutes (TTL)
-  - Task must be assigned to the orchestrator running the command
+  - Task must be assigned to the caller, checked ONLY when the caller is
+    declared via env PI_AUTH_ORCHESTRATOR (the audit line records whether the
+    check ran)
+A fetch that fails, or a task that cannot be read, is a REFUSAL.
+
+A `convex deploy` whose inline CONVEX_DEPLOY_KEY names the DEV environment is
+not a prod deploy and passes without a token (see deploy_key_env()).
 
 Reason: Day 82 doctrine (2026-05-26) -- Pi becomes fleet authority for prod
 deploys. System autonomous, not Laurent-dependent.
@@ -94,6 +102,33 @@ regex was added here -- only the three comment-borne markers
 still read the RAW, unstripped command, by design: they live in comments, and
 the tokenizer strips comments before analysis.
 
+Fix (task k17ehjnazhx88ctt8mkf9cyj218b3fga): the fail-closed fallback for an
+UN-TOKENIZABLE segment decided on two INDEPENDENT substrings ("convex"
+anywhere AND "deploy" anywhere). The environment variable name
+CONVEX_DEPLOY_KEY supplies both on its own, so every command that posed the
+production key was refused -- including a pure READ (`convex data`,
+`convex dashboard`) and even a bare `export CONVEX_DEPLOY_KEY="$(...)"` with
+no convex subcommand at all. The fallback now requires the words ADJACENT as
+an ACTION (UNTOKENIZABLE_DEPLOY_RE), pinned-version suffix included, and the
+`--prod` leg requires `convex` as a whole word (UNTOKENIZABLE_PROD_RE), so a
+real prod action hidden in an un-parsable segment still blocks while a
+variable NAME no longer fires.
+
+Fix (union of the two lineages of this file): the allow path used to accept
+the SPELLING of `# pi-authorized: k...` -- validate_task() existed but was
+never called, so an invented, expired or foreign id passed. The allow path now
+fetches the task and validates it (title marker, TTL, optional declared
+assignee), and a failed fetch refuses. The stdin entrypoint reads stdin ONCE
+into a variable and, if the decision logic crashes on a command that is a
+prod action, exits 2 instead of failing open (see main()). The DEV door, the
+shared reader-inversion predicate, the read-only-query and
+laurent-direct-deploy escapes are kept. One DEV-door narrowing: the dev key
+is now read from the deploy's OWN segment (deploy_is_dev_keyed()), quoted
+values included, and every assignment in that segment must name dev. Before,
+`CONVEX_DEPLOY_KEY=dev:x true; npx convex deploy` -- or an unquoted
+`dev:x|secret`, whose `|` is a pipe -- was waved through as DEV while the
+deploy itself ran with the ambient key.
+
 Override discipline: PI_AUTHORIZED_TASK_ID is meant for one-shot pre-validated
 deploy. Set, run command once, unset. Never persist in shell rc.
 
@@ -123,7 +158,16 @@ from _lib.command_predicate import (  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-VP_CONVEX_URL = "https://compassionate-goldfinch-737.convex.cloud"
+# The deployment the tokens live on. Overridable so the tests can point the
+# fetch at a local stub (never at a real deployment). The override is read from
+# the HOOK process environment, which an inline `VP_CONVEX_URL=... cmd` prefix
+# on the Bash command does not reach. Declared residual: whoever controls the
+# hook process environment and a server that answers `tasks:get` with a valid
+# token could make the guard allow -- the same trust already placed in that
+# environment for PI_AUTHORIZED_TASK_ID.
+VP_CONVEX_URL = os.environ.get(
+    "VP_CONVEX_URL", "https://compassionate-goldfinch-737.convex.cloud"
+)
 HTTP_TIMEOUT_SEC = 10
 TASK_TTL_SEC = 3600  # 60 minutes
 PROD_DEPLOY_TAG = "[PROD-DEPLOY-AUTHORIZED]"
@@ -165,13 +209,36 @@ URL_ACTION_RE = re.compile(r"https://[a-z0-9-]+\.convex\.cloud/api/action\b")
 # `env`-wrapped (`env CONVEX_DEPLOY_KEY=dev:x cmd`); both put the assignment as
 # a literal `CONVEX_DEPLOY_KEY=<val>` token in the command text.
 #
+# The key is read from the deploy's OWN segment, never from anywhere on the
+# line: `CONVEX_DEPLOY_KEY=dev:x true; npx convex deploy` assigns the key to
+# `true`, and the deploy runs with the ambient key -- which may be prod.
+#
 # This discrimination is SCOPED to the `deploy` verb only. An EXPLICIT prod
 # surface -- a `--prod` flag (`env set --prod`, `import --prod`), a `--push`
 # code upload, or a raw `/api/mutation` / `/api/action` HTTP write -- names
 # prod on its own and is NEVER downgraded by a dev key.
 # ---------------------------------------------------------------------------
+# The value may be single-quoted, double-quoted or bare. A real key contains a
+# `|`, so it has to be quoted to reach the command at all: unquoted, the `|` is a
+# PIPE, the assignment stays in the first pipeline stage and the deploy in the
+# next stage runs with whatever key is ambient.
 DEPLOY_KEY_ASSIGN_RE = re.compile(
-    r"\bCONVEX_DEPLOY_KEY=(['\"]?)([^\s'\";|&]*)\1"
+    r"\bCONVEX_DEPLOY_KEY=(?:'([^']*)'|\"([^\"]*)\"|([^\s'\";|&]*))"
+)
+
+# Fallback for a segment the tokenizer cannot parse (command substitution,
+# unbalanced quoting). It must still fail closed on a REAL prod action hidden
+# in there, without firing on prose or on a variable NAME. Two independent
+# substring tests ("convex" somewhere AND "deploy" somewhere) cannot tell
+# `npx convex deploy` from the environment variable CONVEX_DEPLOY_KEY. The
+# deploy leg needs the words ADJACENT as an action, with the optional
+# pinned-version suffix the Convex docs use (`convex@latest deploy`); the
+# `--prod` leg needs `convex` as a whole word (`CONVEX_` is not one).
+UNTOKENIZABLE_DEPLOY_RE = re.compile(
+    r"\bconvex(?:@[\w.\-]+)?\s+deploy\b", re.IGNORECASE
+)
+UNTOKENIZABLE_PROD_RE = re.compile(
+    r"(?<![\w-])convex(?:@[\w.\-]+)?(?![\w-]).*?\s--prod\b", re.IGNORECASE
 )
 
 
@@ -180,14 +247,23 @@ def deploy_key_env(command: str) -> str | None:
 
     Returns "dev", "prod", or None (absent / opaque `$VAR` / unrecognized
     prefix). Only the prefix before the first ':' is read -- the secret half of
-    the key (after the '|') is never inspected."""
-    m = DEPLOY_KEY_ASSIGN_RE.search(command)
-    if not m:
-        return None
-    val = m.group(2)
-    if val.startswith("dev:"):
+    the key (after the '|') is never inspected.
+
+    EVERY assignment on the line is read, not the first: "dev" only when all
+    of them name dev. One dev assignment earlier on the line must not
+    downgrade a prod-keyed or opaque deploy later on the same line."""
+    envs = set()
+    for m in DEPLOY_KEY_ASSIGN_RE.finditer(command):
+        val = next((g for g in m.groups() if g is not None), "")
+        if val.startswith("dev:"):
+            envs.add("dev")
+        elif val.startswith("prod:"):
+            envs.add("prod")
+        else:
+            envs.add(None)
+    if envs == {"dev"}:
         return "dev"
-    if val.startswith("prod:"):
+    if "prod" in envs:
         return "prod"
     return None
 
@@ -323,9 +399,9 @@ def is_prod_deploy(command: str) -> bool:
             # Un-tokenizable segment: fail-closed ONLY if the raw text
             # plausibly names a Convex binary AND a prod-mutating surface --
             # otherwise fail-open (a parsing artifact must never manufacture
-            # a block on an unrelated benign command).
-            low = segment.lower()
-            if "convex" in low and ("deploy" in low or "--prod" in low):
+            # a block on an unrelated benign command, nor on the variable
+            # NAME CONVEX_DEPLOY_KEY).
+            if UNTOKENIZABLE_DEPLOY_RE.search(segment) or UNTOKENIZABLE_PROD_RE.search(segment):
                 return True
             continue
         if head_prod_action(tokens):
@@ -358,17 +434,18 @@ def is_prod_deploy(command: str) -> bool:
     return False
 
 
-def deploy_surface_is_key_only(command: str) -> bool:
-    """True iff the ONLY prod surface in `command` is a bare `convex deploy`
-    verb (target reached via CONVEX_DEPLOY_KEY), with NO explicit-prod surface.
+def deploy_is_dev_keyed(command: str) -> bool:
+    """True iff every prod surface in `command` is a `convex deploy` verb whose
+    OWN segment carries an inline CONVEX_DEPLOY_KEY naming the DEV environment.
 
     Explicit-prod surfaces -- a `--prod` flag, a `--push` code upload, or a raw
     /api/mutation | /api/action HTTP write -- name prod on their own and are
     never key-discriminated. When any is present this returns False, so the
     dev-key downgrade cannot apply and Pi authorization stays required.
 
-    Only when this is True does `deploy_key_env()` decide dev-vs-prod: a
-    `deploy` verb has no `--prod` flag, so its target lives entirely in the key.
+    A `deploy` verb has no `--prod` flag, so its target lives entirely in the
+    key -- and only a key assigned in the deploy's own segment reaches it. A
+    deploy segment without such a key is opaque, and opaque is conservative.
     """
     command = strip_heredocs(command)
     saw_deploy_verb = False
@@ -376,10 +453,15 @@ def deploy_surface_is_key_only(command: str) -> bool:
         if URL_MUTATION_RE.search(segment) or URL_ACTION_RE.search(segment):
             return False  # explicit HTTP prod write
         if tokens is None:
+            # Same fallback words as is_prod_deploy(). The `--prod` test stays
+            # the broad substring on purpose: here it can only REFUSE the dev
+            # downgrade, never grant it.
             low = segment.lower()
             if "convex" in low and "--prod" in low:
                 return False
-            if "convex" in low and "deploy" in low:
+            if UNTOKENIZABLE_DEPLOY_RE.search(segment):
+                if deploy_key_env(segment) != "dev":
+                    return False
                 saw_deploy_verb = True
             continue
         action = head_prod_action(tokens) or carries_prod_action(tokens)
@@ -390,10 +472,11 @@ def deploy_surface_is_key_only(command: str) -> bool:
         # `env set` / `import` / `run`, or a `run --push` code upload -- whose
         # verb_path head is `run`, never `deploy`) is an explicit prod surface
         # the dev key must never downgrade.
-        if action.verb_path and action.verb_path[0] == "deploy":
-            saw_deploy_verb = True
-        else:
+        if not (action.verb_path and action.verb_path[0] == "deploy"):
             return False
+        if deploy_key_env(segment) != "dev":
+            return False
+        saw_deploy_verb = True
     return saw_deploy_verb
 
 
@@ -449,9 +532,9 @@ def has_readonly_marker(command: str) -> bool:
 def has_pi_authorization(command: str) -> bool:
     """Check for Pi-signed authorization (env var, inline flag, or comment).
 
-    Fast-path: does NOT validate the task against VP (that happens in
-    validate_task()). This is intentional -- override mechanisms are
-    already gated by the task creation workflow.
+    SPELLING only: this proves a token-shaped id is present, never that it
+    authorizes anything. run_hook() fetches and validates the task
+    (fetch_task() + validate_task()) before it allows.
     """
     # Env var (set BEFORE subprocess spawn, not inline-prefixed shell var)
     env_task = os.environ.get("PI_AUTHORIZED_TASK_ID", "").strip()
@@ -492,33 +575,58 @@ def has_laurent_override(command: str) -> bool:
 # Task validation
 # ---------------------------------------------------------------------------
 
-def validate_task(task: dict | None, orchestrator: str) -> bool:
+def validate_task(task: dict | None, orchestrator: str | None) -> bool:
     """Validate a Pi-authorization task against required criteria.
 
     Criteria:
-      1. Task must not be None (fetch succeeded)
-      2. Task must have [PROD-DEPLOY-AUTHORIZED] tag
+      1. Task must be a readable object (fetch succeeded)
+      2. [PROD-DEPLOY-AUTHORIZED] must appear in the title or the tags
       3. Task must have been created within TASK_TTL_SEC (60 min)
-      4. Task must be assigned to the requesting orchestrator
+      4. Task must be assigned to the requesting orchestrator -- checked only
+         when the orchestrator is known (not None)
 
     Returns True if all criteria pass, False otherwise.
     """
-    if task is None:
+    if not isinstance(task, dict):
         return False
 
+    # The marker lives in the TITLE on every token actually issued; `tags` is
+    # null on all of them. Checking only `tags` rejects every genuine token,
+    # which is why wiring this function unchanged would have frozen the fleet.
     tags = task.get("tags") or []
-    if PROD_DEPLOY_TAG not in tags:
+    title = task.get("title") or ""
+    if PROD_DEPLOY_TAG not in tags and PROD_DEPLOY_TAG not in title:
         return False
 
     created_ms = task.get("createdAt", 0)
+    if not isinstance(created_ms, (int, float)):
+        return False
     created_sec = created_ms / 1000
     if (time.time() - created_sec) > TASK_TTL_SEC:
         return False
 
-    if task.get("assignedTo") != orchestrator:
+    # The assignee check runs only when the caller is KNOWN. Station identity is
+    # not reliably derivable today: an orchestrator routinely works in a
+    # directory whose own CLAUDE.md names a different orchestrator, so deriving
+    # identity from the path would assert the wrong caller -- worse than
+    # asserting none. When the caller is unknown the check is SKIPPED and the
+    # audit entry records that it was, never silently.
+    if orchestrator is not None and task.get("assignedTo") != orchestrator:
         return False
 
     return True
+
+
+def caller_orchestrator() -> str | None:
+    """The orchestrator running this command, or None when it cannot be known.
+
+    Only an explicit declaration counts. Anything inferred from the working
+    directory would be wrong exactly where it matters.
+    """
+    declared = os.environ.get("PI_AUTH_ORCHESTRATOR", "").strip().lower()
+    if declared and re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", declared):
+        return declared
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -551,8 +659,9 @@ def run_hook(command: str) -> int:
     # AND that inline key names the DEV environment, this guard's intention
     # ("no PROD deploy without Pi") does not apply: allow. An explicit prod
     # surface (`--prod`, `--push`, /api/mutation|action) makes
-    # deploy_surface_is_key_only() False, so it is never downgraded here.
-    if deploy_surface_is_key_only(command) and deploy_key_env(command) == "dev":
+    # deploy_is_dev_keyed() False, so it is never downgraded here; so does a
+    # deploy whose own segment does not carry the dev key.
+    if deploy_is_dev_keyed(command):
         audit_log({
             "ts": int(time.time()),
             "verdict": "allow",
@@ -596,8 +705,9 @@ def run_hook(command: str) -> int:
         print(
             "BLOCKED: Convex prod deploy without Pi-signed authorization.\n"
             "\n"
-            "Pour DEV : utilise `npx convex dev --once` (aucun garde prod ne s'applique). "
-            "Le jeton Pi / la preuve QA ne sont requis QUE pour la PROD.\n"
+            "For DEV: use `npx convex dev --once` (no prod guard applies), or deploy with an "
+            "inline dev key (`CONVEX_DEPLOY_KEY=dev:... npx convex deploy`). "
+            "The Pi token / QA evidence are required for PROD only.\n"
             "\n"
             "Day 82 standing rule (Laurent, mission k57a32vgtyy9x2gjqe456n6hhs87er7v):\n"
             "  Pi = fleet authority for prod deploys. System autonomous, not Laurent-dependent.\n"
@@ -611,12 +721,14 @@ def run_hook(command: str) -> int:
             "To proceed (only after Pi task [PROD-DEPLOY-AUTHORIZED] created):\n"
             "  CANONICAL: npx convex deploy --yes # pi-authorized: k<task-id>\n"
             "\n"
-            "  (Le commentaire shell # est ignoré par convex CLI mais lu par le hook.\n"
-            "  Day 101 friction Omega — l'ancien flag `--pi-authorized-task=k<id>` est rejeté\n"
-            "  par convex CLI comme flag inconnu, et le préfixe env var `PI_AUTHORIZED_TASK_ID=k<id>`\n"
-            "  ne propage pas toujours selon le shell/subagent. Seul le format COMMENT est fiable.)\n"
+            "  (The shell # comment is ignored by the convex CLI but read by the hook.\n"
+            "  The old flag `--pi-authorized-task=k<id>` is rejected by the convex CLI as an\n"
+            "  unknown flag, and the env-var prefix `PI_AUTHORIZED_TASK_ID=k<id>` does not always\n"
+            "  propagate depending on the shell/subagent. Only the COMMENT format is reliable.)\n"
             "\n"
-            "task-id = the VP task where Pi tagged [PROD-DEPLOY-AUTHORIZED] for this deploy.\n"
+            "task-id = the VP task where Pi put [PROD-DEPLOY-AUTHORIZED] in the title for\n"
+            "  this deploy. The hook fetches it: it must be under 60 minutes old (and, when\n"
+            "  PI_AUTH_ORCHESTRATOR is set, assigned to that orchestrator).\n"
             "\n"
             "Exception (rare, Laurent-only): command contains `# laurent-direct-deploy`\n"
             "  -> allow (Laurent manual override always possible).\n"
@@ -629,13 +741,58 @@ def run_hook(command: str) -> int:
         )
         return 2
 
-    # Authorized -- log and allow
+    # The marker is present. That proves its SPELLING, never its authority:
+    # until this point an invented, expired or foreign task id passed. Fetch the
+    # task and validate it. A fetch that fails is a could-not-judge, and a
+    # could-not-judge is a REFUSAL, never an allow.
     task_id = extract_task_id(command)
+    task = fetch_task(task_id) if task_id else None
+    caller = caller_orchestrator()
+
+    if not validate_task(task, caller):
+        if task is None:
+            reason = "task-unreadable-or-absent"
+            detail = (
+                "The authorization task could not be read. Either the id names no "
+                "task, or VantagePeers could not be reached.\n"
+                "\"I could not check\" and \"this is authorized\" are different answers."
+            )
+        else:
+            reason = "task-invalid"
+            detail = (
+                "The task exists but does not authorize this deploy. It must carry "
+                f"{PROD_DEPLOY_TAG} in its title or tags, have been created within "
+                f"{TASK_TTL_SEC // 60} minutes, and -- when the caller is declared -- "
+                "be assigned to that caller."
+            )
+        audit_log({
+            "ts": int(time.time()),
+            "verdict": "block",
+            "reason": reason,
+            "task_id": task_id,
+            "caller": caller,
+            "command": command[:200],
+        })
+        print(
+            f"BLOCKED: the authorization token did not validate ({reason}).\n\n"
+            f"{detail}\n\n"
+            "A token is a task, not a string. Ask the merge authority for a fresh "
+            "one rather than re-spelling this id.\n"
+            "\n"
+            "For DEV: use `npx convex dev --once` -- no token is needed there.\n"
+            "\n"
+            "Audit trail: /tmp/pi-auth-prod-deploy.log\n",
+            file=sys.stderr,
+        )
+        return 2
+
     audit_log({
         "ts": int(time.time()),
         "verdict": "allow",
         "reason": "pi-authorized",
         "task_id": task_id,
+        "caller": caller,
+        "assignee_checked": caller is not None,
         "command": command[:200],
     })
     return 0
@@ -645,20 +802,49 @@ def run_hook(command: str) -> int:
 # Hook entrypoint (stdin dispatch -- skipped during testing)
 # ---------------------------------------------------------------------------
 
-if not globals().get("_TESTING"):
-    try:
-        data = json.load(sys.stdin)
-        tool_name = data.get("tool_name", "")
-        if tool_name != "Bash":
-            sys.exit(0)
+def main(raw_stdin: str) -> int:
+    """Decide on an already-read hook payload. Returns the exit code.
 
+    Takes the stdin TEXT, never the stream: the failure handler below must be
+    able to see the command. An earlier version re-read stdin inside the
+    handler, got "" from the consumed stream, believed the command was empty
+    and fell open on exactly the case it exists to close.
+    """
+    command = ""
+    try:
+        data = json.loads(raw_stdin or "{}")
+        if data.get("tool_name", "") != "Bash":
+            return 0
         command = data.get("tool_input", {}).get("command", "")
         if not command:
-            sys.exit(0)
-
-        sys.exit(run_hook(command))
-
+            return 0
+        return run_hook(command)
     except Exception as e:
-        # Fail-open on any unexpected error to avoid blocking legitimate work
+        # Fail-open is correct for a command that is NOT a prod action: a
+        # parsing accident must never block ordinary work (malformed stdin
+        # lands here with command == ""). It is wrong for one that IS, where an
+        # exception would have become a silent authorization.
+        try:
+            dangerous = bool(command) and is_prod_deploy(command)
+        except Exception:
+            dangerous = bool(command)
+        if dangerous:
+            print(
+                "BLOCKED: the authorization guard could not run on a production "
+                f"deploy ({type(e).__name__}: {e}).\n"
+                "Refusing rather than allowing: a guard that crashed has judged "
+                "nothing.\n",
+                file=sys.stderr,
+            )
+            return 2
         print(f"[hook warning] enforce-pi-authorization-before-prod-deploy: {e}", file=sys.stderr)
-        sys.exit(0)
+        return 0
+
+
+if not globals().get("_TESTING"):
+    # Read stdin ONCE, before any decision; main() only ever sees the text.
+    try:
+        _raw_stdin = sys.stdin.read()
+    except Exception:
+        _raw_stdin = ""
+    sys.exit(main(_raw_stdin))
