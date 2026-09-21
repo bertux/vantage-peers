@@ -128,6 +128,47 @@ describe("tool-exposure filter (data-driven allowlist, registration-point)", () 
 		expect(registeredSet).toEqual(new Set(CORE_NAMES));
 	}, 60_000);
 
+	it("advertises pause_task, resume_task and correct_task_segment: the closure gate's SEGMENT_DURATION_IMPLAUSIBLE refusal names the segment verbs, so a client must be able to call them", () => {
+		const result = runDumpToolNames();
+		expect(result.status).toBe(0);
+		const advertised = new Set<string>(JSON.parse(result.stdout));
+
+		for (const verb of ["pause_task", "resume_task", "correct_task_segment"]) {
+			expect(CORE_NAMES, `${verb} missing from core`).toContain(verb);
+			expect(advertised.has(verb), `${verb} not advertised`).toBe(true);
+		}
+	}, 60_000);
+
+	it("advertises every registered tool named in a closure-gate refusal message, so no refusal points at an uncallable verb", () => {
+		// Every tool the server REGISTERS, enabled or masked.
+		const all = runDumpToolNames({ VP_DUMP_ALL_REGISTERED: "1" });
+		expect(all.status).toBe(0);
+		const registered = new Set<string>(JSON.parse(all.stdout));
+		expect(registered.has("pause_task")).toBe(true);
+
+		const gateSrc = readFileSync(
+			join(PKG_ROOT, "..", "convex", "lib", "taskClosureGate.ts"),
+			"utf-8",
+		);
+		const named = [
+			...new Set(
+				[...gateSrc.matchAll(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g)].map(
+					(m) => m[0],
+				),
+			),
+		].filter((n) => registered.has(n));
+		// Positive control: the gate's current refusal text names these.
+		expect(named).toEqual(
+			expect.arrayContaining(["pause_task", "resume_task", "start_task"]),
+		);
+
+		const result = runDumpToolNames();
+		expect(result.status).toBe(0);
+		const advertised = new Set<string>(JSON.parse(result.stdout));
+		const unreachable = named.filter((n) => !advertised.has(n));
+		expect(unreachable).toEqual([]);
+	}, 60_000);
+
 	it("throws at startup naming an unknown core name, refusing to start", () => {
 		const dir = mkdtempSync(join(tmpdir(), "vp-tool-exposure-"));
 		tempPaths.push(dir);
