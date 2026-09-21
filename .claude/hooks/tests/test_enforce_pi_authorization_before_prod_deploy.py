@@ -13,12 +13,16 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 HOOK = pathlib.Path(__file__).resolve().parent.parent / "enforce-pi-authorization-before-prod-deploy.py"
+HOOKS_DIR = HOOK.parent
 
 # The token fetch NEVER leaves this machine in these tests. By default it is
 # pointed at a closed loopback port (connection refused -> could-not-judge);
@@ -414,6 +418,217 @@ def test_prod_block_message_names_dev_door():
 def test_convex_dev_once_passes():
     rc, _ = run_hook("npx convex dev --once")
     assert rc == 0, "a bare `npx convex dev --once` is never blocked by this guard"
+
+
+# --- IMPORT-GUARDED FALLBACK: the shared module cannot be reached ----------
+# Ported from ElPi-Corp PR #170 (head 94809653, APPROVED). Three corrections
+# over the pre-port guard, each with its own test below:
+#   (1) the `_lib.command_predicate` import is itself guarded -- a raw
+#       command naming a convex deploy is REFUSED (rc=2, "REFUSING TO
+#       JUDGE" + the module name), anything else stays open (rc=0);
+#   (2) strip_quoted_strings unquotes a quoted single word with no
+#       whitespace inside (an ARGUMENT), while a quoted run containing
+#       whitespace stays inert (PROSE);
+#   (3) the degraded fallback strips quote CHARACTERS outright (never a
+#       space) and matches convex...deploy by ORDER, not ADJACENCY.
+
+def build_degraded_world(delete_module=False, strip_carries_prod_action=False):
+    """Copy `.claude/hooks/` into a fresh tmp dir and degrade the shared
+    module there -- never touch the real checkout. Returns the path to the
+    copied guard script.
+
+    `delete_module=True`  -> world (a): the module file is gone entirely.
+    `strip_carries_prod_action=True` -> world (b): the module is present but
+    stale -- missing the very name the guard imports.
+    """
+    tmp = tempfile.mkdtemp(prefix="pi-guard-degraded-")
+    dest_hooks = pathlib.Path(tmp) / "hooks"
+    shutil.copytree(HOOKS_DIR, dest_hooks, ignore=shutil.ignore_patterns("__pycache__"))
+    module_path = dest_hooks / "_lib" / "command_predicate.py"
+    if delete_module:
+        module_path.unlink()
+    elif strip_carries_prod_action:
+        src = module_path.read_text()
+        match = re.search(r"\ndef carries_prod_action\(.*?\n(?=\ndef |\Z)", src, re.DOTALL)
+        assert match, "carries_prod_action definition not found to strip"
+        module_path.write_text(src[: match.start()] + "\n" + src[match.end() :])
+    return dest_hooks / "enforce-pi-authorization-before-prod-deploy.py"
+
+
+def run_degraded_hook(guard_path, command, extra_env=None):
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    env = dict(os.environ)
+    env.pop("PI_AUTHORIZED_TASK_ID", None)
+    env.pop("PI_AUTH_ORCHESTRATOR", None)
+    env["VP_CONVEX_URL"] = DEAD_URL
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.run(
+        [sys.executable, str(guard_path)], input=payload,
+        capture_output=True, text=True, timeout=15, env=env, cwd=str(guard_path.parent),
+    )
+    return proc.returncode, proc.stderr + proc.stdout
+
+
+def test_import_failure_module_deleted_refuses_named_prod_deploy():
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "CONVEX_DEPLOY_KEY=prod:y npx convex deploy --yes")
+    assert rc == 2, f"a named prod deploy must refuse when the module is gone, rc={rc} out={out}"
+    assert "REFUSING TO JUDGE" in out and "command_predicate" in out
+
+
+def test_import_failure_module_deleted_allows_benign_command():
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "ls -la")
+    assert rc == 0, f"a command not naming a deploy must stay open, rc={rc} out={out}"
+
+
+def test_import_failure_stale_module_refuses_named_prod_deploy():
+    guard = build_degraded_world(strip_carries_prod_action=True)
+    rc, out = run_degraded_hook(guard, "CONVEX_DEPLOY_KEY=prod:y npx convex deploy --yes")
+    assert rc == 2, f"a stale module missing carries_prod_action must still refuse, rc={rc} out={out}"
+    assert "REFUSING TO JUDGE" in out
+
+
+def test_import_failure_stale_module_allows_benign_command():
+    guard = build_degraded_world(strip_carries_prod_action=True)
+    rc, out = run_degraded_hook(guard, "npx convex dev --once")
+    assert rc == 0, f"dev subcommand must stay open on a stale module, rc={rc} out={out}"
+
+
+def test_import_failure_matches_by_order_not_adjacency():
+    """Corner (1)+(3): a flag BETWEEN the two words defeats an adjacency
+    check but not an order check."""
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "CONVEX_DEPLOY_KEY=prod:y npx convex --verbose deploy")
+    assert rc == 2, f"words in order (not adjacent) must still be refused, rc={rc} out={out}"
+
+
+def test_import_failure_strips_quote_characters_split_binary():
+    """Corner (3): quote CHARACTERS are deleted (never replaced by a space),
+    so a split binary `"con"'vex'` still reads as the single word convex."""
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "CONVEX_DEPLOY_KEY=prod:y npx \"con\"'vex' deploy")
+    assert rc == 2, f"split binary must be caught by the degraded fallback, rc={rc} out={out}"
+
+
+def test_import_failure_strips_quote_characters_split_verb():
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "CONVEX_DEPLOY_KEY=prod:y npx convex de''ploy")
+    assert rc == 2, f"split verb must be caught by the degraded fallback, rc={rc} out={out}"
+
+
+def test_import_failure_interpreter_and_pipe_wrapped_prod_refused():
+    guard = build_degraded_world(delete_module=True)
+    for cmd in (
+        'bash -c "npx convex deploy --yes"',
+        "sh -c 'npx convex deploy --yes'",
+        'eval "npx convex deploy --yes"',
+        "echo 'npx convex deploy --yes' | bash",
+    ):
+        rc, out = run_degraded_hook(guard, cmd)
+        assert rc == 2, f"{cmd!r} must be refused in the degraded world, rc={rc} out={out}"
+
+
+def test_import_failure_dev_subcommand_still_passes():
+    """The degraded fallback cannot see a dev key at all -- but a bare
+    `convex dev --once` never names the deploy action words to begin with."""
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "npx convex dev --once")
+    assert rc == 0, f"dev subcommand must not be refused, rc={rc} out={out}"
+
+
+def test_import_failure_lookalike_binary_not_matched():
+    """`"con"'ex'` spells conex, never convex -- the degraded fallback must
+    not over-match a binary name that merely resembles convex."""
+    guard = build_degraded_world(delete_module=True)
+    rc, out = run_degraded_hook(guard, "npx \"con\"'ex' deploy")
+    assert rc == 0, f"conex is not convex, rc={rc} out={out}"
+
+
+# --- The degraded fallback refuses the guard's WHOLE production set -------
+# Not `deploy` alone: every form the healthy path refuses without a token
+# (a `--prod` flag on any subcommand, a `run --push --prod` code upload) must
+# be refused when the module is gone or stale. `--push` WITHOUT `--prod`
+# targets the default (dev) deployment and passes in the healthy world, so it
+# passes here too -- the fallback mirrors the healthy set, it does not invent
+# a wider one.
+
+DEGRADED_PROD_MUST_BLOCK = (
+    "npx convex env set FOO bar --prod",
+    "npx convex env remove FOO --prod",
+    "npx convex run someModule:fn --prod",
+    "npx convex import --prod data.zip",
+    "npx convex run someModule:fn --push --prod",
+    "npx convex@1.2.3 run someModule:fn --prod",
+    "npx \"con\"'vex' env set FOO bar --prod",
+    "bash -c \"npx convex run someModule:fn --prod\"",
+)
+
+DEGRADED_PROD_MUST_PASS = (
+    "ls",
+    "npx convex dev --once",
+    "npx \"con\"'ex' deploy",
+    "npx \"con\"'ex' run someModule:fn --prod",
+    "npx convex run someModule:fn --push",
+    "npx convex env set FOO bar",
+    "git commit -m \"fix: the prod flag is documented\"",
+    "export CONVEX_DEPLOY_KEY_NAME=x; echo --prod",
+)
+
+
+def _degraded_cells(guard, commands, expected_rc):
+    wrong = []
+    for cmd in commands:
+        rc, out = run_degraded_hook(guard, cmd)
+        if rc != expected_rc:
+            wrong.append((cmd, rc))
+        elif expected_rc == 2:
+            assert "REFUSING TO JUDGE" in out and "command_predicate" in out, (
+                f"{cmd!r} refused without naming the module: {out}"
+            )
+    return wrong
+
+
+def test_import_failure_module_deleted_refuses_every_prod_form():
+    guard = build_degraded_world(delete_module=True)
+    wrong = _degraded_cells(guard, DEGRADED_PROD_MUST_BLOCK, 2)
+    assert not wrong, f"module deleted: these must refuse (cmd, rc): {wrong}"
+
+
+def test_import_failure_stale_module_refuses_every_prod_form():
+    guard = build_degraded_world(strip_carries_prod_action=True)
+    wrong = _degraded_cells(guard, DEGRADED_PROD_MUST_BLOCK, 2)
+    assert not wrong, f"stale module: these must refuse (cmd, rc): {wrong}"
+
+
+def test_import_failure_module_deleted_non_prod_stays_open():
+    guard = build_degraded_world(delete_module=True)
+    wrong = _degraded_cells(guard, DEGRADED_PROD_MUST_PASS, 0)
+    assert not wrong, f"module deleted: these must stay open (cmd, rc): {wrong}"
+
+
+def test_import_failure_stale_module_non_prod_stays_open():
+    guard = build_degraded_world(strip_carries_prod_action=True)
+    wrong = _degraded_cells(guard, DEGRADED_PROD_MUST_PASS, 0)
+    assert not wrong, f"stale module: these must stay open (cmd, rc): {wrong}"
+
+
+# --- strip_quoted_strings: an argument is unquoted, a phrase stays inert ---
+
+def test_strip_quoted_single_word_unquotes_as_argument():
+    """Corner (2): `npx 'convex' deploy` -- the quotes carry an ARGUMENT the
+    shell would run identically unquoted, so they are noise and removed."""
+    guard = load_hook_module()
+    assert guard.strip_quoted_strings("npx 'convex' deploy --yes") == "npx convex deploy --yes"
+    assert guard.strip_quoted_strings('npx "convex" deploy --yes') == "npx convex deploy --yes"
+
+
+def test_strip_quoted_phrase_with_whitespace_stays_inert():
+    """A quoted run containing whitespace is PROSE -- it is emptied, not
+    unquoted, so a search string is never read as a command."""
+    guard = load_hook_module()
+    assert guard.strip_quoted_strings('grep -r "convex deploy" docs/') == 'grep -r "" docs/'
 
 
 if __name__ == "__main__":
