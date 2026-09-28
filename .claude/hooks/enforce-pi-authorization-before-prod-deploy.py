@@ -21,7 +21,29 @@ validates it before allowing:
   - Task must be assigned to the caller, checked ONLY when the caller is
     declared via env PI_AUTH_ORCHESTRATOR (the audit line records whether the
     check ran)
-A fetch that fails, or a task that cannot be read, is a REFUSAL.
+THREE OUTCOMES, never two (task k172pesxfj94bm3ed6q790fhnx8f628x):
+  1. ALLOW (exit 0)  -- a valid, unexpired, correctly-shaped token was read as
+     an IDENTIFIED caller.
+  2. BLOCK (exit 2)  -- the token WAS read and is forged, absent, expired,
+     unmarked or assigned elsewhere.
+  3. REFUSE TO JUDGE (exit 2) -- the read itself could not be completed: no
+     credential, a network failure, an error status the positive control
+     cannot attribute to the id, or a shape the guard cannot classify.
+
+The two refusing states share exit 2 because only 2 stops the tool call under
+the hook protocol -- a refusal that exited anything else would be an ALLOW
+wearing another name. They are separated where the operator READS them: the
+stderr text ("BLOCKED:" vs "COULD NOT CHECK:") and the audit log's `verdict` /
+`reason`. "I could not check" and "this is not authorised" are different
+answers and must never be spelled the same way.
+
+Fix (task k172pesxfj94bm3ed6q790fhnx8f628x): the guard read its own token with
+NO identity. That was harmless while `tasks:get` served any reader, and became
+a fleet-wide production outage the day the anonymous read doors closed
+(bd8c60e9) -- every authorized deploy on every station was refused as
+"task-unreadable-or-absent". The guard now presents the SAME service-account
+Clerk identity the MCP server already uses (no new identity layer), so it is
+served the grant it legitimately holds.
 
 A `convex deploy` whose inline CONVEX_DEPLOY_KEY names the DEV environment is
 not a prod deploy and passes without a token (see deploy_key_env()).
@@ -143,6 +165,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -254,7 +277,7 @@ VP_CONVEX_URL = os.environ.get(
 HTTP_TIMEOUT_SEC = 10
 TASK_TTL_SEC = 3600  # 60 minutes
 PROD_DEPLOY_TAG = "[PROD-DEPLOY-AUTHORIZED]"
-AUDIT_LOG = "/tmp/pi-auth-prod-deploy.log"
+AUDIT_LOG = os.environ.get("VP_GUARD_AUDIT_LOG", "/tmp/pi-auth-prod-deploy.log")
 
 # Raw HTTP WRITE surfaces to a Convex deployment. These are not process
 # invocations (no argv head to test) -- they are URL substrings inside a
@@ -380,33 +403,346 @@ AUTHORIZED_TASK_RE = re.compile(r"\bk[a-z0-9]{15,40}\b")
 # HTTP fetch (stdlib only -- no subprocess)
 # ---------------------------------------------------------------------------
 
-def fetch_task(task_id: str) -> dict | None:
-    """Fetch task from VantagePeers via Convex HTTP public query API.
+# The guard presents an identity when it reads its token (task
+# k172pesxfj94bm3ed6q790fhnx8f628x). Before this, it POSTed `tasks:get` with
+# `Content-Type` and nothing else. That was harmless while `tasks:get` served
+# any reader; it became a fleet-wide production outage the day the anonymous
+# read doors were closed (bd8c60e9, convex/tasks.ts `get`: `withOrgScope(ctx,
+# {refuseWithoutThrow: true})` then `if (!isRowVisibleToScope(scope, task))
+# return null`). A caller with no Authorization header has no scope, so EVERY
+# task read as null and EVERY authorized deploy was refused as
+# "task-unreadable-or-absent".
+#
+# This is the second direction of `.claude/rules/a-permission-fails-in-two-
+# directions.md`: a permission fails not only by serving rows nobody was
+# granted, but by withholding rows the caller WAS granted, because the read
+# path never consults the grant.
+#
+# NO NEW IDENTITY LAYER (`one-identity-layer.md`). The credential is the one
+# the MCP server already uses for exactly this purpose: a Clerk session JWT
+# minted for the dedicated service-account user, which `convex/lib/auth.ts`
+# recognises by id (CLERK_SERVICE_ACCOUNT_USER_ID) and grants master scope --
+# a named allowlist check, never a right granted by absence. The mint flow is
+# the one in `mcp-server/src/serviceAccountAuth.ts`, ported to stdlib so a hook
+# process can run it: sign-in ticket -> ticket redemption -> template-scoped
+# session token.
+#
+# Variables NAMED here, never their values; nothing minted is logged, printed
+# or written to disk.
+#   VP_GUARD_CONVEX_TOKEN  -- an already-minted bearer, when a caller has one.
+#   CLERK_SECRET_KEY       -- Clerk Backend API key, to mint one.
+#   CLERK_SERVICE_ACCOUNT_USER_ID -- the service-account user to mint it for.
+#   VP_GUARD_ENV_FILE      -- dotenv to read the two above from when they are
+#                             absent from the hook process environment (a hook
+#                             does not inherit the shell's `.env.local`).
+#                             Defaults to the repo-root `.env.local`.
+CLERK_DEFAULT_DOMAIN = "https://sharp-sponge-67.clerk.accounts.dev"
+CLERK_API = "https://api.clerk.com/v1"
 
-    Workspace-agnostic -- no Convex CLI auth required.
-    Convex arg name is `taskId` (verified Day 90 via curl).
 
-    Returns dict on success, None on any failure (network, not found, timeout).
+class ReadOutcome:
+    """Three states, never two -- see read_task()."""
+
+    READ = "read"          # the store answered and we were served as an identified caller
+    UNREADABLE = "unreadable"  # the read itself could not be completed
+
+
+# Clerk's API refuses urllib's default `Python-urllib/3.x` agent with a bare
+# HTTP 403 -- measured, not guessed: the identical request carrying a named
+# agent succeeds, and the same flow through `curl` always did. That 403 arrives
+# as a mint failure, which this guard correctly reports as COULD NOT CHECK; a
+# guard permanently unable to identify itself is still a guard that judges
+# nothing, so the agent is NAMED here rather than left to the default.
+GUARD_USER_AGENT = "vantagepeers-prod-deploy-guard/1.0"
+
+
+def _post_json(url: str, payload: dict | None, headers: dict, *, form: str | None = None):
+    """POST and return the decoded JSON body. Raises on any failure."""
+    if form is not None:
+        data = form.encode("utf-8")
+    else:
+        data = json.dumps(payload).encode("utf-8")
+    headers = {"User-Agent": GUARD_USER_AGENT, **headers}
+    req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
+        if response.status != 200:
+            raise OSError(f"HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _dotenv_value(name: str) -> str | None:
+    """Read ONE variable from the dotenv the hook is allowed to consult.
+
+    A hook process does not inherit the operator's shell environment, so the
+    credential that is already provisioned on this station lives in a
+    gitignored `.env.local` rather than in `env`. Only the two names this
+    function is asked for are ever read, and the value is returned to the
+    caller -- never logged, never printed, never echoed into a message.
     """
-    payload = json.dumps(
-        {"path": "tasks:get", "args": {"taskId": task_id}, "format": "json"}
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        url=f"{VP_CONVEX_URL}/api/query",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    path = os.environ.get("VP_GUARD_ENV_FILE")
+    if path is None:
+        path = str(Path(__file__).resolve().parents[2] / ".env.local")
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
-            if response.status != 200:
-                return None
-            data = json.loads(response.read().decode("utf-8"))
-            if data.get("status") != "success":
-                return None
-            return data.get("value")
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() != name:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                return value or None
+    except OSError:
         return None
+    return None
+
+
+def _credential(name: str) -> str | None:
+    return (os.environ.get(name) or "").strip() or _dotenv_value(name)
+
+
+def guard_identity() -> tuple[str | None, str]:
+    """The bearer the guard presents, plus a reason when it has none.
+
+    Returns (token, "") on success and (None, <what was checked>) otherwise.
+    The reason names VARIABLES, never values -- it is printed to the operator.
+    """
+    preminted = (os.environ.get("VP_GUARD_CONVEX_TOKEN") or "").strip()
+    if preminted:
+        return preminted, ""
+
+    secret = _credential("CLERK_SECRET_KEY")
+    user_id = _credential("CLERK_SERVICE_ACCOUNT_USER_ID")
+    if not secret or not user_id:
+        missing = [n for n, v in (
+            ("CLERK_SECRET_KEY", secret),
+            ("CLERK_SERVICE_ACCOUNT_USER_ID", user_id),
+        ) if not v]
+        return None, (
+            "no credential is reachable from this hook process. Checked: "
+            "VP_GUARD_CONVEX_TOKEN (unset), then "
+            f"{' and '.join(missing)} in the environment and in the dotenv named "
+            "by VP_GUARD_ENV_FILE (default: the repo-root .env.local)."
+        )
+
+    domain = os.environ.get("CLERK_DOMAIN") or CLERK_DEFAULT_DOMAIN
+    template = os.environ.get("CLERK_JWT_TEMPLATE") or "convex"
+    try:
+        ticket = _post_json(
+            f"{CLERK_API}/sign_in_tokens",
+            {"user_id": user_id, "expires_in_seconds": 30},
+            {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        ).get("token")
+        if not ticket:
+            return None, "Clerk issued no sign-in ticket for CLERK_SERVICE_ACCOUNT_USER_ID."
+        session = (_post_json(
+            f"{domain}/v1/client/sign_ins",
+            None,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            form=urllib.parse.urlencode({"strategy": "ticket", "ticket": ticket}),
+        ).get("response") or {}).get("created_session_id")
+        if not session:
+            return None, "the Clerk sign-in ticket exchange returned no session."
+        jwt = _post_json(
+            f"{CLERK_API}/sessions/{session}/tokens/{template}",
+            {},
+            {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        ).get("jwt")
+        if not jwt:
+            return None, f"Clerk minted no JWT for template {template!r}."
+        return jwt, ""
+    except Exception as exc:
+        # The MESSAGE only. A Clerk error body never carries the secret, but
+        # the exception TYPE and text are all that is reproduced here anyway.
+        return None, f"minting the service identity failed ({type(exc).__name__}: {exc})."
+
+
+# ---------------------------------------------------------------------------
+# THE POSITIVE CONTROL -- and the property it must have.
+#
+# The BLOCK-versus-REFUSE decision rests on one fact: "was I, THIS caller with
+# THIS credential, served?" A control that can succeed WITHOUT the credential
+# cannot establish that fact, however healthy it looks.
+#
+# The first control here was `tasks:listUnlinkedBlocked`, accepted on
+# `status == "success"`. MEASURED on the real deployment:
+#
+#   tasks:listUnlinkedBlocked   anonymous -> success value=list[159]
+#                               identified -> success value=list[159]
+#
+# Identical. It separated "store up" from "store down" -- real, but not the
+# question. And it was about to get worse in the direction that matters: that
+# query is one of the fifteen doors closed by #1349 (beeb5d5c, merged, NOT yet
+# deployed), after which an unidentified caller receives a TYPED EMPTY
+# (`status:"success", value:[]`) -- the refusal shape chosen for reactively
+# subscribed reads. A control keyed on "did it answer" reads that refusal as
+# health. A broken credential would then look healthy, the token read would
+# fail, and the guard would conclude "the id names nothing" and BLOCK when the
+# truth is "I could not identify myself" and the honest answer is REFUSE TO
+# JUDGE. That is this task's own collapse, relocated a second time.
+#
+# `missions:list` is chosen against three requirements:
+#
+#  1. IT CANNOT SUCCEED WITHOUT THE CREDENTIAL. It resolves the caller and
+#     calls `requireScope(scope, "view-own-missions")` (convex/missions.ts),
+#     which THROWS for a scope-less caller. Measured:
+#       anonymous  -> error, errorData "RBAC_DENIED: Missing scope ..."
+#       identified -> success value=list[30]
+#  2. ITS REFUSAL IS RECOGNISABLE BY CONTENT. The throw is a `ConvexError`, so
+#     its payload survives to the wire as `errorData` even in prod, where an
+#     ordinary fault is an opaque "[Request ID: ...] Server Error" with no
+#     data. `RBAC_DENIED` in `errorData` is therefore a POSITIVE identification
+#     of "reached, not identified" -- it is never inferred from an absence.
+#  3. ITS MEANING DOES NOT CHANGE UNDER THE DEPLOY IT GATES. `convex/missions.ts`
+#     is NOT among the fifteen files #1349 touches (`convex/tasks.ts` IS). A
+#     control whose behaviour changes under the very deploy it gates silently
+#     changes meaning at the moment it matters.
+#
+# It also lives in a DIFFERENT module from the token read (`tasks:get`), so it
+# cannot fail for the same cause; and when it does fail ambiguously the guard
+# moves towards REFUSE, never towards BLOCK.
+#
+# Overridable, because a station may need to name a different control -- but
+# any replacement must satisfy the three requirements above.
+LIVENESS_PATH = os.environ.get("VP_GUARD_LIVENESS_PATH", "missions:list")
+
+# The three wire-level states the control distinguishes.
+CONTROL_SERVED = "identified-and-served"
+CONTROL_NOT_IDENTIFIED = "reached-but-not-identified"
+CONTROL_NOT_REACHED = "not-reached"
+
+# The refusal marker `convex/lib/auth.ts` puts in every deny branch's
+# ConvexError. Matched against the error PAYLOAD only, never the message of an
+# opaque fault.
+RBAC_DENIED_MARKER = "RBAC_DENIED"
+
+
+def store_is_answering(token: str) -> tuple[str, str]:
+    """Was THIS caller, with THIS credential, served by the store just now?
+
+    Returns one of CONTROL_SERVED / CONTROL_NOT_IDENTIFIED / CONTROL_NOT_REACHED
+    plus a human detail. Only CONTROL_SERVED licenses reading a failed token
+    read as "the id names nothing"; both other states are REFUSE TO JUDGE.
+    """
+    try:
+        body = _post_json(
+            f"{VP_CONVEX_URL}/api/query",
+            {"path": LIVENESS_PATH, "args": {}, "format": "json"},
+            {"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        )
+    except Exception as exc:
+        return CONTROL_NOT_REACHED, f"{type(exc).__name__}: {exc}"
+
+    if body.get("status") == "success":
+        # An identified caller may legitimately have ZERO missions, so the
+        # verdict is deliberately "was I served at all", never "did I get
+        # rows" -- an unidentified caller does not reach a success here, it
+        # is thrown out by requireScope.
+        return CONTROL_SERVED, ""
+
+    # A ConvexError's payload reaches the wire as `errorData`. An ordinary
+    # server fault carries none. So this is a POSITIVE identification of a
+    # refusal, not a guess from an absence.
+    payload = json.dumps(body.get("errorData"))
+    if RBAC_DENIED_MARKER in payload:
+        return CONTROL_NOT_IDENTIFIED, (
+            f"the control {LIVENESS_PATH} refused this caller "
+            f"({RBAC_DENIED_MARKER}) -- the credential presented was not "
+            "accepted by the deployment"
+        )
+    return CONTROL_NOT_REACHED, (
+        f"the control {LIVENESS_PATH} failed without a recognisable refusal "
+        f"({str(body.get('errorMessage'))[:120]})"
+    )
+
+
+def read_task(task_id: str) -> tuple[str, dict | None, str]:
+    """Read the authorization token as an IDENTIFIED caller. Three outcomes.
+
+      (READ, <dict>, "")   -- served the row. Judge it.
+      (READ, None, "")     -- served, AND the id names no task. A real absence,
+                              because we were identified: BLOCK.
+      (UNREADABLE, None, why) -- the read could not be completed at all. Not a
+                              BLOCK and not an ALLOW: REFUSE TO JUDGE.
+
+    The last distinction is the whole point. `value: null` means BOTH "no such
+    task" and "you may not see it". Only a caller that PRESENTED an identity
+    may read null as an absence; an unidentified one must call it unreadable,
+    or it will one day allow on a refusal -- the same defect class as the leak
+    that closing these doors fixed, pointing the other way. So when no identity
+    can be presented, this function never asks the question at all.
+    """
+    token, why = guard_identity()
+    if not token:
+        return ReadOutcome.UNREADABLE, None, why
+
+    try:
+        body = _post_json(
+            f"{VP_CONVEX_URL}/api/query",
+            {"path": "tasks:get", "args": {"taskId": task_id}, "format": "json"},
+            {"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        )
+    except Exception as exc:
+        return ReadOutcome.UNREADABLE, None, (
+            f"VantagePeers could not be reached ({type(exc).__name__}: {exc})."
+        )
+
+    if body.get("status") != "success":
+        # MEASURED on the real deployment, not assumed: `tasks:get` answers an
+        # id that names no row with `status:"error"` and an OPAQUE
+        # "[Request ID: ...] Server Error" -- the `v.id("tasks")` validator
+        # throws, and prod hides the detail. A malformed id, a well-formed
+        # absent id, and a genuine backend fault are BYTE-IDENTICAL here. So
+        # the error text cannot classify anything, and reading it as "absent"
+        # would be the very collapse this rewrite exists to end, relocated one
+        # step along.
+        #
+        # A POSITIVE CONTROL separates them, exactly as the diagnosis of this
+        # defect did ("the instrument answers, it does not accept everything").
+        # We ask the SAME deployment a question we know it can answer. If it
+        # answers, the deployment is reachable and serving, so the fault is in
+        # the ID we asked about -- the token is absent or malformed, and that
+        # is a BLOCK. If it cannot answer either, the read genuinely could not
+        # be completed, and that is REFUSE TO JUDGE.
+        state, probe_why = store_is_answering(token)
+        if state == CONTROL_SERVED:
+            # The deployment served THIS caller a query that no unidentified
+            # caller can reach. So the credential works and the fault is in
+            # the ID we asked about: the token is absent or malformed. BLOCK.
+            return ReadOutcome.READ, None, ""
+        if state == CONTROL_NOT_IDENTIFIED:
+            return ReadOutcome.UNREADABLE, None, (
+                f"the credential was NOT accepted by the deployment ({probe_why}). "
+                "Nothing has been judged about the token -- it may be perfectly "
+                "valid. Renew or repair the identity named below."
+            )
+        return ReadOutcome.UNREADABLE, None, (
+            "VantagePeers errored on tasks:get, and the positive control cannot "
+            f"confirm this caller was served either ({probe_why}). The token "
+            "itself was never read, so nothing about it has been judged."
+        )
+    value = body.get("value")
+    if value is not None and not isinstance(value, dict):
+        return ReadOutcome.UNREADABLE, None, (
+            f"tasks:get returned a shape this guard cannot classify ({type(value).__name__})."
+        )
+    if value is None:
+        # Success AND null, while we presented an identity. On this deployment
+        # a missing row ERRORS (see above), so a null here is the DOOR, not an
+        # absence: `convex/tasks.ts` `get` returns null via isRowVisibleToScope
+        # when the caller has no scope. That is precisely the pre-fix symptom,
+        # and it must never again be read as "the token is not there".
+        return ReadOutcome.UNREADABLE, None, (
+            "the store answered but served null, which on this deployment means "
+            "the reader was REFUSED rather than that the token is absent (an "
+            "absent id errors). The identity presented was not accepted -- check "
+            "that CLERK_SERVICE_ACCOUNT_USER_ID names the same user the "
+            "deployment grants scope to."
+        )
+    return ReadOutcome.READ, value, ""
 
 
 # ---------------------------------------------------------------------------
@@ -855,16 +1191,65 @@ def run_hook(command: str) -> int:
     # task and validate it. A fetch that fails is a could-not-judge, and a
     # could-not-judge is a REFUSAL, never an allow.
     task_id = extract_task_id(command)
-    task = fetch_task(task_id) if task_id else None
     caller = caller_orchestrator()
+    outcome, task, why = read_task(task_id) if task_id else (
+        ReadOutcome.UNREADABLE, None, "no task id could be extracted from the marker."
+    )
 
+    # THIRD STATE -- REFUSE TO JUDGE. The read itself could not be completed:
+    # no credential, a network failure, an error status, or a shape this guard
+    # cannot classify. This is neither "authorised" nor "not authorised", and
+    # collapsing it into either one is the defect. It still exits 2, because
+    # under the hook protocol only 2 actually stops the tool call and a refusal
+    # that let the deploy run would be an allow by another name -- so the two
+    # are separated where the operator READS them: this text, and the audit
+    # log's `reason`.
+    if outcome == ReadOutcome.UNREADABLE:
+        audit_log({
+            "ts": int(time.time()),
+            "verdict": "refuse-to-judge",
+            "reason": "token-read-could-not-be-completed",
+            "detail": why[:300],
+            "task_id": task_id,
+            "caller": caller,
+            "command": command[:200],
+        })
+        print(
+            "COULD NOT CHECK: this guard could not read the authorization token, "
+            "so it has judged NOTHING.\n"
+            "\n"
+            "This is NOT a refusal of your token -- it may well be valid. It is the "
+            "guard saying it cannot tell.\n"
+            f"\nWhat happened: {why}\n"
+            "\n"
+            "The token store serves a task only to an IDENTIFIED reader "
+            "(convex/tasks.ts `get` -> isRowVisibleToScope), so this guard must "
+            "present an identity to read its own token. It uses the credential the "
+            "MCP server already uses: a Clerk service-account session JWT.\n"
+            "\n"
+            "To restore it, make ONE of these readable by the hook process "
+            "(names only -- never put a value in a command line, a log or a commit):\n"
+            "  - VP_GUARD_CONVEX_TOKEN        an already-minted Convex bearer\n"
+            "  - CLERK_SECRET_KEY + CLERK_SERVICE_ACCOUNT_USER_ID   to mint one,\n"
+            "    in the environment or in the dotenv named by VP_GUARD_ENV_FILE\n"
+            "    (default: the repo-root .env.local)\n"
+            "\n"
+            "Audit trail: /tmp/pi-auth-prod-deploy.log (verdict: refuse-to-judge)\n",
+            file=sys.stderr,
+        )
+        return 2
+
+    # SECOND STATE -- BLOCK. The token WAS read, as an identified caller, and it
+    # does not authorize this deploy: the id names no task (forged), or the task
+    # is expired / unmarked / assigned elsewhere. `task is None` is a genuine
+    # ABSENCE here and only here, because the read was served.
     if not validate_task(task, caller):
         if task is None:
-            reason = "task-unreadable-or-absent"
+            reason = "token-absent"
             detail = (
-                "The authorization task could not be read. Either the id names no "
-                "task, or VantagePeers could not be reached.\n"
-                "\"I could not check\" and \"this is authorized\" are different answers."
+                "The token was read successfully and the id names NO task. "
+                "This is an absence, not a permission problem -- the guard was "
+                "served, and there was nothing there."
             )
         else:
             reason = "task-invalid"
@@ -883,7 +1268,8 @@ def run_hook(command: str) -> int:
             "command": command[:200],
         })
         print(
-            f"BLOCKED: the authorization token did not validate ({reason}).\n\n"
+            f"BLOCKED: the authorization token was read, and it does not authorize "
+            f"this deploy ({reason}).\n\n"
             f"{detail}\n\n"
             "A token is a task, not a string. Ask the merge authority for a fresh "
             "one rather than re-spelling this id.\n"
